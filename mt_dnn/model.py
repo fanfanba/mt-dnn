@@ -3,6 +3,7 @@
 import logging
 
 import numpy as np
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -36,10 +37,12 @@ class MTDNNModel(object):
         self.total_param = sum([p.nelement() for p in self.network.parameters() if p.requires_grad])
 
         no_decay = ['bias', 'gamma', 'beta', 'LayerNorm.bias', 'LayerNorm.weight']
+
         optimizer_parameters = [
-            {'params': [p for n, p in self.network.named_parameters() if n not in no_decay], 'weight_decay_rate': 0.01},
-            {'params': [p for n, p in self.network.named_parameters() if n in no_decay], 'weight_decay_rate': 0.0}
-            ]
+            {'params': [p for n, p in self.network.named_parameters() if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+            {'params': [p for n, p in self.network.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        ]
+        
         # note that adamax are modified based on the BERT code
         if opt['optimizer'] == 'sgd':
             self.optimizer = optim.sgd(optimizer_parameters, opt['learning_rate'],
@@ -107,6 +110,11 @@ class MTDNNModel(object):
     def update(self, batch_meta, batch_data):
         self.network.train()
         labels = batch_data[batch_meta['label']]
+        soft_labels = None
+        temperature = 1.0
+        if self.config.get('mkd_opt', 0) > 0 and ('soft_label' in batch_meta):
+            soft_labels = batch_meta['soft_label']
+
         if batch_meta['pairwise']:
             labels = labels.contiguous().view(-1, batch_meta['pairwise_size'])[:, 0]
         if self.config['cuda']:
@@ -133,11 +141,24 @@ class MTDNNModel(object):
                 loss = torch.mean(F.mse_loss(logits.squeeze(), y, reduce=False) * weight)
             else:
                 loss = torch.mean(F.cross_entropy(logits, y, reduce=False) * weight)
+                if soft_labels is not None:
+                    # compute KL
+                    label_size = soft_labels.size(1)
+                    kd_loss = F.kl_div(F.log_softmax(logits.view(-1, label_size).float(), 1), soft_labels) * label_size
+                    loss = loss + kd_loss
         else:
             if task_type > 0:
                 loss = F.mse_loss(logits.squeeze(), y)
             else:
                 loss = F.cross_entropy(logits, y)
+                if soft_labels is not None:
+                    # compute KL
+                    label_size = soft_labels.size(1)
+                    # note that kl_div return element-wised mean, thus it requires to time with the label size
+                    # In the pytorch v1.x, it simply uses the flag: reduction='batchmean'
+                    # TODO: updated the package to support the latest PyTorch (xiaodl)
+                    kd_loss = F.kl_div(F.log_softmax(logits.view(-1, label_size).float(), 1), soft_labels) * label_size
+                    loss = loss + kd_loss
 
         self.train_loss.update(loss.item(), logits.size(0))
         self.optimizer.zero_grad()
@@ -181,6 +202,13 @@ class MTDNNModel(object):
             predict = np.argmax(score, axis=1).tolist()
             score = score.reshape(-1).tolist()
         return score, predict, batch_meta['label']
+
+    def extract(self, batch_meta, batch_data):
+        self.network.eval()
+        # 'token_id': 0; 'segment_id': 1; 'mask': 2
+        inputs = batch_data[:3]
+        all_encoder_layers, pooled_output = self.mnetwork.bert(*inputs)
+        return all_encoder_layers, pooled_output
 
     def save(self, filename):
         network_state = dict([(k, v.cpu()) for k, v in self.network.state_dict().items()])
